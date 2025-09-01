@@ -1,4 +1,4 @@
-// Auto-detect dimension ids for sex and age
+// Auto-sum ages fallback
 import fs from 'node:fs/promises';
 
 const API_BASE = 'https://api.beta.ons.gov.uk/v1';
@@ -50,48 +50,77 @@ async function run(){
     .map(v => ({ version: v.version, n: Number(v.version) || 0 }))
     .sort((a,b) => b.n - a.n)[0].version;
 
-  // Discover dimension ids
-  const dims = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}`);
-  const dimList = (dims.dimensions || []).map(d => ({ id: d.id, label: d.label?.toLowerCase() || d.id }));
-  console.log('Dimensions:', dimList);
+  // Discover dimensions
+  const verMeta = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}`);
+  const dims = verMeta.dimensions || [];
+  const dimIds = Object.fromEntries(dims.map(d => [d.label?.toLowerCase() || d.id, d.id]));
+  const sexDim = dimIds['sex'] || 'sex';
+  const ageDim = dimIds['age'] || dimIds['single-year-of-age'] || 'age';
+  const timeDim = dimIds['time'] || dimIds['calendar-years'] || 'time';
+  const geoDim = dimIds['geography'] || dimIds['administrative-geography'] || 'geography';
+  console.log('Dim map:', { sexDim, ageDim, timeDim, geoDim });
 
-  // Guess sex/age dimension names
-  const sexDim = dimList.find(d => /sex|persons/.test(d.id) || /sex|persons/.test(d.label))?.id;
-  const ageDim = dimList.find(d => /age/.test(d.id) || /age/.test(d.label))?.id;
-  if(!sexDim || !ageDim) throw new Error(`Could not identify sex/age dims from ${JSON.stringify(dimList)}`);
-
+  // Options helpers
+  async function getOptions(dim){
+    const opts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/${dim}/options?limit=5000`);
+    return opts.items || [];
+  }
   async function findOption(dim, pattern){
-    const opts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/${dim}/options?limit=1000`);
-    const it = (opts.items || []).find(o => pattern.test(String(o.label).toLowerCase()));
+    const opts = await getOptions(dim);
+    const it = opts.find(o => pattern.test(String(o.label).toLowerCase()) || pattern.test(String(o.id).toLowerCase()));
     return it && (it.option || it.id);
   }
 
-  const sexId = await findOption(sexDim, /all\s*persons|persons|all person/);
-  const ageId = await findOption(ageDim, /all\s*ages|all ages/);
-  if(!sexId || !ageId) throw new Error('Missing sex/age options');
+  // Sex: prefer All persons; fallback first option
+  let sexId = await findOption(sexDim, /all\\s*persons|all persons|persons|all/);
+  if(!sexId){
+    const opts = await getOptions(sexDim);
+    sexId = (opts[0]?.option) || (opts[0]?.id);
+  }
 
-  const timeOpts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/time/options?limit=2000`);
+  // Time latest
+  const timeOpts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/${timeDim}/options?limit=5000`);
   const timeItems = (timeOpts.items || []).map(o => o.option || o.id).sort();
   const latestTime = timeItems[timeItems.length - 1];
   if(!latestTime) throw new Error('No time found');
 
-  const obs = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?geography=${LA_GSS}&${encodeURIComponent(sexDim)}=${encodeURIComponent(sexId)}&${encodeURIComponent(ageDim)}=${encodeURIComponent(ageId)}&time=${encodeURIComponent(latestTime)}`);
-  const first = (obs.observations || [])[0];
-  const value = first?.observation ?? first?.value;
-  const periodLabel = first?.dimensions?.time?.label || latestTime;
-  if(value == null) throw new Error('No observation value');
+  // Age: try All ages, else sum all numeric ages
+  let ageId = await findOption(ageDim, /all\\s*ages|all ages|total/);
+  let total = null;
+
+  if(ageId){
+    // single call
+    const obs = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?${geoDim}=${LA_GSS}&${sexDim}=${encodeURIComponent(sexId)}&${ageDim}=${encodeURIComponent(ageId)}&${timeDim}=${encodeURIComponent(latestTime)}`);
+    const first = (obs.observations || [])[0];
+    total = first?.observation ?? first?.value;
+  }else{
+    // sum all ages 0..120 (numeric labels)
+    const ageOpts = await getOptions(ageDim);
+    const numericAges = ageOpts.filter(o => /^\\d+$/.test(String(o.label)));
+    if(!numericAges.length) throw new Error('No numeric ages to sum');
+    let sum = 0;
+    for(const ao of numericAges){
+      const aid = ao.option || ao.id;
+      const obs = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?${geoDim}=${LA_GSS}&${sexDim}=${encodeURIComponent(sexId)}&${ageDim}=${encodeURIComponent(aid)}&${timeDim}=${encodeURIComponent(latestTime)}`);
+      const val = (obs.observations || [])[0]?.observation ?? (obs.observations || [])[0]?.value;
+      sum += Number(val || 0);
+    }
+    total = sum;
+  }
+
+  if(total == null) throw new Error('No observation value');
 
   await fs.mkdir('data', { recursive: true });
   const out = {
     geography: LA_GSS,
-    population: Number(value),
+    population: Number(total),
     period: String(latestTime),
-    period_label: String(periodLabel),
+    period_label: String(latestTime),
     dataset_id: datasetId,
     dataset_title: ds.title,
     updated_at: new Date().toISOString()
   };
-  await fs.writeFile('data/data.json', JSON.stringify(out, null, 2) + '\n', 'utf8');
+  await fs.writeFile('data/data.json', JSON.stringify(out, null, 2) + '\\n', 'utf8');
   console.log('Wrote data/data.json:', out);
 }
 
