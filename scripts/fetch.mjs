@@ -1,4 +1,4 @@
-// Updated: broaden dataset search and add logging
+// Auto-detect dimension ids for sex and age
 import fs from 'node:fs/promises';
 
 const API_BASE = 'https://api.beta.ons.gov.uk/v1';
@@ -15,28 +15,22 @@ async function api(path){
 
 function looksLikePopEst(title=''){
   const t = title.toLowerCase();
-  return t.includes('population') && t.includes('estimate') && (t.includes('england') || t.includes('wales') || t.includes('uk'));
+  return t.includes('population') && t.includes('estimate');
 }
 
 async function run(){
-  // Try Search API first
-  const search = await api(`/search?q=${encodeURIComponent('population estimates local authority')}&content_type=dataset&limit=200`);
+  const search = await api(`/search?q=${encodeURIComponent('population estimates')}&content_type=dataset&limit=200`);
   const items = (search.items || []).map(i => ({
     id: i?.description?.dataset_id || (i?.uri || '').split('/').pop(),
     title: i?.description?.title || ''
   }));
-  console.log('Search returned datasets:', items.map(i => i.title));
-
   let ds = items.find(i => looksLikePopEst(i.title));
-  // Fallback: try general dataset list and pick first plausible
   if(!ds){
     const all = await api('/datasets?limit=500');
     const list = (all.items || []).map(i => ({ id: i.id, title: i.title || i.description || '' }));
-    console.log('Datasets fallback sample:', list.slice(0, 10));
     ds = list.find(i => looksLikePopEst(i.title));
   }
-  if(!ds?.id) throw new Error('Dataset not found after broadened search');
-
+  if(!ds?.id) throw new Error('Dataset not found');
   const datasetId = ds.id;
   console.log('Using dataset:', datasetId, ds.title);
 
@@ -56,14 +50,24 @@ async function run(){
     .map(v => ({ version: v.version, n: Number(v.version) || 0 }))
     .sort((a,b) => b.n - a.n)[0].version;
 
-  async function findOption(dim, predicate){
+  // Discover dimension ids
+  const dims = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}`);
+  const dimList = (dims.dimensions || []).map(d => ({ id: d.id, label: d.label?.toLowerCase() || d.id }));
+  console.log('Dimensions:', dimList);
+
+  // Guess sex/age dimension names
+  const sexDim = dimList.find(d => /sex|persons/.test(d.id) || /sex|persons/.test(d.label))?.id;
+  const ageDim = dimList.find(d => /age/.test(d.id) || /age/.test(d.label))?.id;
+  if(!sexDim || !ageDim) throw new Error(`Could not identify sex/age dims from ${JSON.stringify(dimList)}`);
+
+  async function findOption(dim, pattern){
     const opts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/${dim}/options?limit=1000`);
-    const it = (opts.items || []).find(predicate);
+    const it = (opts.items || []).find(o => pattern.test(String(o.label).toLowerCase()));
     return it && (it.option || it.id);
   }
 
-  const sexId = await findOption('sex', o => /all\s*persons|persons/i.test(o.label));
-  const ageId = await findOption('age', o => /all\s*ages/i.test(o.label));
+  const sexId = await findOption(sexDim, /all\s*persons|persons|all person/);
+  const ageId = await findOption(ageDim, /all\s*ages|all ages/);
   if(!sexId || !ageId) throw new Error('Missing sex/age options');
 
   const timeOpts = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/time/options?limit=2000`);
@@ -71,7 +75,7 @@ async function run(){
   const latestTime = timeItems[timeItems.length - 1];
   if(!latestTime) throw new Error('No time found');
 
-  const obs = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?geography=${LA_GSS}&sex=${encodeURIComponent(sexId)}&age=${encodeURIComponent(ageId)}&time=${encodeURIComponent(latestTime)}`);
+  const obs = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?geography=${LA_GSS}&${encodeURIComponent(sexDim)}=${encodeURIComponent(sexId)}&${encodeURIComponent(ageDim)}=${encodeURIComponent(ageId)}&time=${encodeURIComponent(latestTime)}`);
   const first = (obs.observations || [])[0];
   const value = first?.observation ?? first?.value;
   const periodLabel = first?.dimensions?.time?.label || latestTime;
