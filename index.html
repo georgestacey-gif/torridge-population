@@ -1,0 +1,129 @@
+<!--
+SharePoint widget: Torridge District population (latest mid-year estimate)
+
+HOW TO USE (Modern SharePoint):
+1) Add the PnP "Modern Script Editor" web part to your page (or any script-enabled web part).
+2) Paste this entire snippet and publish. It fetches directly from the ONS Beta API (no key required).
+
+Notes:
+- Uses ONS Developer Hub API base https://api.beta.ons.gov.uk/v1
+- Looks up the correct Population Estimates dataset and the latest edition/version at runtime.
+- Selects Torridge by its GSS code E07000046.
+- Chooses "All persons" and "All ages" then displays the latest available period.
+- If anything fails, a helpful error message is shown.
+-->
+
+<div id="torridge-population-widget" class="tpw">
+  <div class="tpw-card" role="group" aria-labelledby="tpw-title">
+    <div class="tpw-title" id="tpw-title">Torridge population</div>
+    <div class="tpw-value" id="tpw-value" aria-live="polite">Loading…</div>
+    <div class="tpw-meta" id="tpw-meta"></div>
+  </div>
+</div>
+
+<style>
+  .tpw{display:flex;justify-content:center;}
+  .tpw-card{max-width:560px;width:100%;padding:16px 20px;border-radius:16px;box-shadow:0 6px 20px rgba(0,0,0,.08);background:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .tpw-title{font-size:20px;font-weight:700;margin-bottom:6px}
+  .tpw-value{font-size:40px;font-weight:800;letter-spacing:.5px}
+  .tpw-meta{font-size:12px;color:#666;margin-top:6px}
+  .tpw a{color:inherit}
+</style>
+
+<script>
+(async () => {
+  const API_BASE = "https://api.beta.ons.gov.uk/v1"; // ONS Developer Hub (beta) API
+  const LA_GSS = "E07000046"; // Torridge (GSS code)
+  const DATASET_TITLE_RE = /Estimates of the population for England and Wales/i; // dataset title to match
+
+  const elValue = document.getElementById("tpw-value");
+  const elMeta  = document.getElementById("tpw-meta");
+
+  function showError(msg){
+    elValue.textContent = "Unavailable";
+    elMeta.textContent = msg;
+  }
+
+  async function api(path){
+    const res = await fetch(`${API_BASE}${path}`, { headers: { "Accept": "application/json" }});
+    if (!res.ok) throw new Error(`ONS API ${res.status}: ${path}`);
+    return res.json();
+  }
+
+  try {
+    // 1) Find the Population Estimates dataset id via Search API
+    const search = await api(`/search?q=${encodeURIComponent("population estimates local authority")}&content_type=dataset&limit=100`);
+    const datasetItem = (search.items || []).map(i => ({
+      id: i?.description?.dataset_id || (i?.uri || "").split("/").pop(),
+      title: i?.description?.title || "",
+      latest_release: i?.description?.latest_release,
+    })).find(it => DATASET_TITLE_RE.test(it.title));
+
+    if(!datasetItem || !datasetItem.id){
+      throw new Error("Couldn't identify Population Estimates dataset id.");
+    }
+
+    const datasetId = datasetItem.id;
+
+    // 2) Get the latest edition for that dataset (editions are like: mid-2024, etc.)
+    const editionsResp = await api(`/datasets/${datasetId}/editions`);
+    const editions = editionsResp.items || [];
+    if(!editions.length) throw new Error("No editions found.");
+
+    // Choose the most recently updated edition (defensive against sort order changes)
+    const latestEdition = editions
+      .map(e => ({ edition: e.edition, last: Date.parse(e.last_updated || 0) || 0 }))
+      .sort((a,b) => b.last - a.last)[0].edition;
+
+    // 3) Get the latest version within that edition
+    const versionsResp = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions`);
+    const versions = versionsResp.items || [];
+    if(!versions.length) throw new Error("No versions found.");
+    const latestVersion = versions
+      .map(v => ({ version: v.version, n: Number(v.version) || 0 }))
+      .sort((a,b) => b.n - a.n)[0].version;
+
+    // 4) Discover dimension option ids for sex=All persons and age=All ages
+    async function findOptionId(dimName, tester){
+      const optsResp = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/${dimName}/options`);
+      const items = optsResp.items || [];
+      const match = items.find(o => tester(o));
+      return match && (match.option || match.id);
+    }
+
+    const sexId = await findOptionId("sex", o => /all\s*persons|persons/i.test(o.label));
+    const ageId = await findOptionId("age", o => /all\s*ages/i.test(o.label));
+
+    if(!sexId || !ageId){
+      throw new Error("Couldn't locate 'All persons' or 'All ages' dimension options.");
+    }
+
+    // 5) Get the latest available time option
+    const timeOptsResp = await api(`/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/dimensions/time/options?limit=1000`);
+    const timeItems = (timeOptsResp.items || []).map(o => o.option || o.id);
+    if(!timeItems.length) throw new Error("No time options found.");
+
+    // The labels are usually 'mid-YYYY' or year-like; pick the last sorted naturally
+    const latestTime = timeItems.sort().pop();
+
+    // 6) Request the observation for Torridge, All persons, All ages, latest time
+    const obsPath = `/datasets/${datasetId}/editions/${encodeURIComponent(latestEdition)}/versions/${latestVersion}/observations?geography=${LA_GSS}&sex=${encodeURIComponent(sexId)}&age=${encodeURIComponent(ageId)}&time=${encodeURIComponent(latestTime)}`;
+    const obsResp = await api(obsPath);
+
+    const first = (obsResp.observations || [])[0];
+    const value = first && (first.observation ?? first.value);
+    const periodLabel = first?.dimensions?.time?.label || latestTime;
+
+    if(value == null){
+      throw new Error("No observation value returned.");
+    }
+
+    elValue.textContent = Number(value).toLocaleString("en-GB");
+    elMeta.textContent = `Mid-year estimate, ${periodLabel} · Source: ONS`;
+
+  } catch(err){
+    console.error(err);
+    showError("Could not fetch from ONS API. Check web part permissions/CORS and try again.");
+  }
+})();
+</script>
